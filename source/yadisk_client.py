@@ -1,13 +1,14 @@
 import os
 import yadisk
-from pathlib import Path
+import io
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 import tempfile
+from docx import Document
 
 from .logger import logger
 
-# Пытаемся импортировать определение кодировки
+# Пытаемся импортировать определение кодировки (оставим для TXT файлов)
 try:
     from charset_normalizer import from_bytes
 
@@ -67,19 +68,6 @@ class YandexDiskClient:
             logger.error(f"Failed to ensure folder {full_path}: {e}")
             return False
 
-    def ensure_path(self, path: str) -> bool:
-        """
-        Убеждается, что папка существует. Если нет — создаёт её.
-        Оставлено для обратной совместимости.
-
-        Args:
-            path: Путь к папке на Яндекс.Диске
-
-        Returns:
-            True если папка существует или была создана
-        """
-        return self.ensure_folder_exists(path)
-
     def get_daily_log_path(self, profile_name: str, date: datetime) -> str:
         """
         Формирует путь к файлу лога за указанную дату.
@@ -87,107 +75,17 @@ class YandexDiskClient:
         Returns:
             Полный путь к файлу лога
         """
-        # XLog/Profile/logs/YYYY/MM/DD/log.txt
         return f"{profile_name}/logs/{date.year}/{date.month:02d}/{date.day:02d}/log.txt"
 
-    def append_to_file(self, remote_path: str, content: str) -> bool:
+    def read_docx(self, remote_path: str) -> Optional[str]:
         """
-        Дописывает содержимое в конец файла.
-
-        Args:
-            remote_path: Путь к файлу на Яндекс.Диске (относительно корня)
-            content: Текст для добавления
-
-        Returns:
-            True если успешно
-        """
-        full_path = f"/{self.root_folder}/{remote_path}"
-        temp_file = None
-
-        try:
-            # Убеждаемся, что папка для файла существует
-            folder_path = '/'.join(remote_path.split('/')[:-1])
-            if folder_path:
-                self.ensure_folder_exists(folder_path)
-
-            # Создаём временный файл
-            with tempfile.NamedTemporaryFile(mode='w+', encoding='utf-8', delete=False) as tf:
-                temp_file = tf.name
-
-                # Если файл существует на Диске — скачиваем
-                if self.client.exists(full_path):
-                    self.client.download(full_path, temp_file)
-
-                # Дописываем новое содержимое
-                with open(temp_file, 'a', encoding='utf-8') as f:
-                    f.write(content)
-
-                # Загружаем обратно на Диск
-                self.client.upload(temp_file, full_path, overwrite=True)
-
-            logger.debug(f"Appended to {full_path}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Failed to append to {full_path}: {e}")
-            return False
-
-        finally:
-            # Удаляем временный файл
-            if temp_file and os.path.exists(temp_file):
-                os.unlink(temp_file)
-
-    def write_to_file(self, remote_path: str, content: str) -> bool:
-        """
-        Записывает содержимое в файл (перезаписывает).
-
-        Args:
-            remote_path: Путь к файлу на Яндекс.Диске (относительно корня)
-            content: Текст для записи
-
-        Returns:
-            True если успешно
-        """
-        full_path = f"/{self.root_folder}/{remote_path}"
-        temp_file = None
-
-        try:
-            # Убеждаемся, что папка для файла существует
-            folder_path = '/'.join(remote_path.split('/')[:-1])
-            if folder_path:
-                self.ensure_folder_exists(folder_path)
-
-            # Создаём временный файл
-            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False) as tf:
-                temp_file = tf.name
-                tf.write(content)
-                tf.flush()
-
-            # Загружаем на Диск
-            self.client.upload(temp_file, full_path, overwrite=True)
-
-            logger.debug(f"Written to {full_path}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Failed to write to {full_path}: {e}")
-            return False
-
-        finally:
-            # Удаляем временный файл
-            if temp_file and os.path.exists(temp_file):
-                os.unlink(temp_file)
-
-    def read_file(self, remote_path: str) -> Optional[str]:
-        """
-        Читает содержимое файла с Яндекс.Диска.
-        АВТОМАТИЧЕСКИ определяет кодировку через charset-normalizer.
+        Читает содержимое DOCX файла с Яндекс.Диска.
 
         Args:
             remote_path: Путь к файлу на Яндекс.Диске (относительно корня)
 
         Returns:
-            Содержимое файла или None
+            Текст из документа или None
         """
         full_path = f"/{self.root_folder}/{remote_path}"
         temp_file = None
@@ -196,41 +94,117 @@ class YandexDiskClient:
             if not self.client.exists(full_path):
                 return None
 
-            # Скачиваем файл как БАЙТЫ (не пытаемся декодировать)
+            # Скачиваем файл во временный
+            with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tf:
+                temp_file = tf.name
+                self.client.download(full_path, temp_file)
+
+            # Открываем через python-docx
+            doc = Document(temp_file)
+
+            # Собираем весь текст из параграфов
+            text = '\n'.join([paragraph.text for paragraph in doc.paragraphs])
+
+            logger.info(f"✅ Successfully read DOCX {remote_path} ({len(text)} chars)")
+            return text
+
+        except Exception as e:
+            logger.error(f"Failed to read DOCX {full_path}: {e}")
+            return None
+
+        finally:
+            if temp_file and os.path.exists(temp_file):
+                os.unlink(temp_file)
+
+    def write_docx(self, remote_path: str, content: str) -> bool:
+        """
+        Создаёт или перезаписывает DOCX файл на Яндекс.Диске.
+
+        Args:
+            remote_path: Путь к файлу на Яндекс.Диске (относительно корня)
+            content: Текст для записи в документ
+
+        Returns:
+            True если успешно
+        """
+        full_path = f"/{self.root_folder}/{remote_path}"
+        temp_file = None
+
+        try:
+            # Убеждаемся, что папка для файла существует
+            folder_path = '/'.join(remote_path.split('/')[:-1])
+            if folder_path:
+                self.ensure_folder_exists(folder_path)
+
+            # Создаём временный DOCX файл
+            with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tf:
+                temp_file = tf.name
+
+                # Создаём новый документ
+                doc = Document()
+
+                # Добавляем текст (разбиваем по строкам)
+                for line in content.split('\n'):
+                    doc.add_paragraph(line)
+
+                # Сохраняем
+                doc.save(temp_file)
+
+            # Загружаем на Диск
+            self.client.upload(temp_file, full_path, overwrite=True)
+
+            logger.info(f"✅ Successfully wrote DOCX {remote_path} ({len(content)} chars)")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to write DOCX {full_path}: {e}")
+            return False
+
+        finally:
+            if temp_file and os.path.exists(temp_file):
+                os.unlink(temp_file)
+
+    def read_file(self, remote_path: str) -> Optional[str]:
+        """
+        Универсальное чтение файла. Если файл .docx — использует read_docx.
+        Если .txt — использует старое чтение с определением кодировки.
+        """
+        if remote_path.lower().endswith('.docx'):
+            return self.read_docx(remote_path)
+        else:
+            return self._read_text_file(remote_path)
+
+    def _read_text_file(self, remote_path: str) -> Optional[str]:
+        """
+        Читает текстовый файл с автоопределением кодировки.
+        """
+        full_path = f"/{self.root_folder}/{remote_path}"
+        temp_file = None
+
+        try:
+            if not self.client.exists(full_path):
+                return None
+
             with tempfile.NamedTemporaryFile(mode='rb', delete=False) as tf:
                 temp_file = tf.name
                 self.client.download(full_path, temp_file)
 
-            # Читаем байты из временного файла
             with open(temp_file, 'rb') as f:
                 raw_data = f.read()
 
-            # Пробуем определить кодировку
             if CHARSET_DETECT_AVAILABLE and raw_data:
                 try:
                     result = from_bytes(raw_data).best()
-
                     if result:
-                        encoding = result.encoding
                         content = str(result)
-                        logger.info(
-                            f"✅ Auto-detected encoding for {remote_path}: {encoding} (confidence: {result.quality})")
-
-                        # Убираем BOM если есть (на всякий случай)
                         if content and content.startswith('\ufeff'):
                             content = content[1:]
-
                         return content
-                    else:
-                        logger.warning(f"Charset detection failed for {remote_path}, trying fallback")
-                        return self._fallback_decode(raw_data, remote_path)
-                except Exception as e:
-                    logger.warning(f"Error in charset detection: {e}, using fallback")
-                    return self._fallback_decode(raw_data, remote_path)
-            else:
-                # Если библиотека не установлена — используем старый метод
-                logger.debug(f"Using fallback decoder for {remote_path}")
-                return self._fallback_decode(raw_data, remote_path)
+                except Exception:
+                    pass
+
+            # Fallback
+            return self._fallback_decode(raw_data, remote_path)
 
         except Exception as e:
             logger.error(f"Failed to read {full_path}: {e}")
@@ -241,62 +215,62 @@ class YandexDiskClient:
                 os.unlink(temp_file)
 
     def _fallback_decode(self, raw_data: bytes, remote_path: str) -> Optional[str]:
-        """
-        Запасной метод с перебором кодировок (если нет charset-normalizer)
-        """
+        """Запасной метод с перебором кодировок"""
         encodings = ['utf-8', 'windows-1251', 'koi8-r', 'cp866', 'iso-8859-5']
 
         for encoding in encodings:
             try:
                 content = raw_data.decode(encoding)
-                # Проверяем, что результат похож на текст
-                if self._looks_like_text(content):
-                    logger.info(f"Fallback: {remote_path} decoded as {encoding}")
-
-                    # Убираем BOM если есть
-                    if content and content.startswith('\ufeff'):
-                        content = content[1:]
-
-                    return content
+                logger.info(f"Fallback: {remote_path} decoded as {encoding}")
+                if content and content.startswith('\ufeff'):
+                    content = content[1:]
+                return content
             except UnicodeDecodeError:
                 continue
 
-        # Если ничего не помогло — пробуем с игнорированием ошибок
         try:
-            content = raw_data.decode('utf-8', errors='ignore')
-            logger.warning(f"Fallback: {remote_path} decoded with errors='ignore'")
-            return content
+            return raw_data.decode('utf-8', errors='ignore')
         except:
-            logger.error(f"Failed to decode {remote_path} with any method")
             return None
 
-    def _looks_like_text(self, text: str) -> bool:
+    def write_file(self, remote_path: str, content: str) -> bool:
         """
-        Простая эвристика: проверяем, что текст похож на нормальный русский/английский
+        Универсальная запись файла. Если путь заканчивается на .docx — создаёт DOCX.
+        Иначе — обычный текст.
         """
-        if not text or len(text) < 10:
+        if remote_path.lower().endswith('.docx'):
+            return self.write_docx(remote_path, content)
+        else:
+            return self._write_text_file(remote_path, content)
+
+    def _write_text_file(self, remote_path: str, content: str) -> bool:
+        """Записывает текстовый файл в UTF-8"""
+        full_path = f"/{self.root_folder}/{remote_path}"
+        temp_file = None
+
+        try:
+            folder_path = '/'.join(remote_path.split('/')[:-1])
+            if folder_path:
+                self.ensure_folder_exists(folder_path)
+
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False) as tf:
+                temp_file = tf.name
+                tf.write(content)
+                tf.flush()
+
+            self.client.upload(temp_file, full_path, overwrite=True)
+            logger.debug(f"Written to {full_path}")
             return True
 
-        # Считаем долю нормальных символов
-        good_chars = 0
-        total_chars = 0
+        except Exception as e:
+            logger.error(f"Failed to write to {full_path}: {e}")
+            return False
 
-        for ch in text[:1000]:  # Проверяем только первые 1000 символов
-            total_chars += 1
-            # Буквы, цифры, пробелы, знаки препинания
-            if ch.isalpha() or ch.isdigit() or ch.isspace() or ch in ',.!?-;:"()[]{}':
-                good_chars += 1
-            # Русские буквы в UTF-8 (диапазон)
-            elif '\u0400' <= ch <= '\u04FF':  # Кириллица
-                good_chars += 1
+        finally:
+            if temp_file and os.path.exists(temp_file):
+                os.unlink(temp_file)
 
-        if total_chars == 0:
-            return True
-
-        ratio = good_chars / total_chars
-        return ratio > 0.6  # Допускаем до 40% "странных" символов
-
-    def list_files(self, remote_path: str) -> list:
+    def list_files(self, remote_path: str) -> List[str]:
         """
         Возвращает список файлов в папке.
 
